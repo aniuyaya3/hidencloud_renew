@@ -290,6 +290,14 @@ class HidenCloudBot:
                 self.log("⚡️ 续期成功，已跳转账单页，自动执行支付...")
                 self.perform_pay_from_html(res.text, res.url)
             else:
+                # ===== Fix 3: 先检查响应HTML里是否直接含有账单链接 =====
+                soup_resp = BeautifulSoup(res.text, 'html.parser')
+                for a in soup_resp.find_all('a', href=True):
+                    if '/invoice/' in a['href']:
+                        self.log(f"🔗 在响应HTML中发现账单链接: {a['href']}")
+                        self.pay_single_invoice(a['href'])
+                        return
+                # ===== Fix 3 结束 =====
                 # 核心改进：提取服务端拦截的真实报错信息
                 soup_err = BeautifulSoup(res.text, 'html.parser')
                 err_div = soup_err.find('div', class_=re.compile(r'(alert-danger|text-danger|error)'))
@@ -298,41 +306,47 @@ class HidenCloudBot:
                     # 抓取到了红字警告，说明被服务端逻辑拦截（如总时长超出上限等）
                     self.log(f"⚠️ 续期请求被服务端拒绝，页面提示: {err_div.get_text(strip=True)}")
                 else:
-                    self.log("⚠️ 提交成功但未自动跳转，可能异步生成。后置检查账单...")
-                    self.check_and_pay_invoices(service['id'], is_precheck=False)
+                    self.log(f"⚠️ 提交成功但未自动跳转，响应URL: {res.url} | 状态码: {res.status_code}")
+                    self.log("后置轮询检查账单...")
+                    self.check_and_pay_invoices(service['id'], is_precheck=False, retries=3)
 
         except Exception as e:
             self.log(f"处理异常: {e}")
 
-    def check_and_pay_invoices(self, service_id, is_precheck=False):
-        """
-        is_precheck 标志用于控制日志输出，防止前置检查时刷屏
-        """
-        if not is_precheck:
-            sleep_random(2000, 3000)
-            
-        try:
-            res = self.request('GET', f"/service/{service_id}/invoices?where=unpaid")
-            soup = BeautifulSoup(res.text, 'html.parser')
-            
-            invoice_links = []
-            for a in soup.find_all('a', href=True):
-                if '/invoice/' in a['href'] and 'download' not in a['href']:
-                    invoice_links.append(a['href'])
-            
-            unique_invoices = list(set(invoice_links))
-            
-            if not unique_invoices:
-                if not is_precheck:
-                    self.log("⚪ 无未支付账单")
-                return
+    def check_and_pay_invoices(self, service_id, is_precheck=False, retries=1):
+      if not is_precheck:
+          sleep_random(2000, 3000)
 
-            self.log(f"🔍 发现 {len(unique_invoices)} 个未付账单，准备清理...")
-            for url in unique_invoices:
-                self.pay_single_invoice(url)
-                sleep_random(3000, 5000)
-        except Exception as e:
-            self.log(f"查账单出错: {e}")
+      for attempt in range(retries):
+          try:
+              res = self.request('GET', f"/service/{service_id}/invoices?where=unpaid")
+              soup = BeautifulSoup(res.text, 'html.parser')
+
+              invoice_links = []
+              for a in soup.find_all('a', href=True):
+                  if '/invoice/' in a['href'] and 'download' not in a['href']:
+                      invoice_links.append(a['href'])
+
+              unique_invoices = list(set(invoice_links))
+
+              if not unique_invoices:
+                  if retries > 1 and attempt < retries - 1:
+                      self.log(f"⚪ 第{attempt+1}次检查无账单，5秒后重试...")
+                      time.sleep(5)
+                      continue
+                  if not is_precheck:
+                      self.log("⚪ 无未支付账单")
+                  return
+
+              self.log(f"🔍 发现 {len(unique_invoices)} 个未付账单，准备清理...")
+              for url in unique_invoices:
+                  self.pay_single_invoice(url)
+                  sleep_random(3000, 5000)
+              return  # 成功处理后退出
+
+          except Exception as e:
+              self.log(f"查账单出错: {e}")
+              return
 
     def pay_single_invoice(self, url):
         try:
