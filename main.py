@@ -9,12 +9,12 @@ import json
 import random
 import re
 import requests
-import cloudscraper # 必须保留，因为你已经用了 Cloudflare 绕过
+import cloudscraper
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
 
 # ================= 配置常量 =================
-RENEW_DAYS = 7  # 根据你截图里是7天，这里改成了7
+RENEW_DAYS = 7
 CACHE_FILE_NAME = 'hiden_cookies.json'
 LOCAL_CACHE_PATH = os.path.join(os.path.dirname(__file__), CACHE_FILE_NAME)
 
@@ -22,40 +22,35 @@ LOCAL_CACHE_PATH = os.path.join(os.path.dirname(__file__), CACHE_FILE_NAME)
 ALL_LOGS = []
 
 def log_print(msg):
-    """
-    既打印到控制台，也记录到内存供推送使用
-    """
     print(msg)
-    # 将日志加入全局列表
     ALL_LOGS.append(str(msg))
 
 # ================= 消息推送模块 =================
 def send_notify(text, desp):
     token = os.environ.get("WP_APP_TOKEN_ONE")
     uids_str = os.environ.get("WP_UIDs")
-    
+
     if not token or not uids_str:
         log_print("⚠️ 未配置 WxPusher，跳过推送")
         return
 
     log_print(f"\n==== 开始推送通知: {text} ====\n")
-    
+
     uids = [u.strip() for u in re.split(r'[,;\n]', uids_str) if u.strip()]
-    
+
     url = 'https://wxpusher.zjiecode.com/api/send/message'
     data = {
         "appToken": token,
-        # 将日志列表拼接成 HTML 格式，换行符转 <br>
         "content": f"<h3>{text}</h3><br><div style='font-size:14px;'>{desp.replace(chr(10), '<br>')}</div>",
-        "summary": text, # 消息列表摘要
-        "contentType": 2, # HTML
+        "summary": text,
+        "contentType": 2,
         "uids": uids
     }
-    
+
     try:
         res = requests.post(url, json=data)
         if res.status_code == 200:
-            print("✅ WxPusher 推送成功") # 这里用print不用log_print防止无限套娃
+            print("✅ WxPusher 推送成功")
         else:
             print(f"❌ WxPusher 推送响应: {res.text}")
     except Exception as e:
@@ -67,7 +62,7 @@ class WebDavManager:
         self.url = os.environ.get("WEBDAV_URL", "")
         self.user = os.environ.get("WEBDAV_USER")
         self.password = os.environ.get("WEBDAV_PASS")
-        
+
         if self.url and not self.url.endswith('/'):
             self.url += '/'
         self.full_url = self.url + CACHE_FILE_NAME if self.url else ""
@@ -76,7 +71,7 @@ class WebDavManager:
         if not self.url or not self.user:
             log_print("⚠️ 未配置 WebDAV，跳过云端同步")
             return
-            
+
         log_print("☁️ 正在从 Infinicloud 下载缓存...")
         try:
             res = requests.get(self.full_url, auth=(self.user, self.password), timeout=30)
@@ -94,13 +89,13 @@ class WebDavManager:
     def upload(self, data):
         if not self.url or not self.user:
             return
-        
+
         log_print("☁️ 正在上传最新缓存到 Infinicloud...")
         try:
             json_str = json.dumps(data, indent=2)
             res = requests.put(
-                self.full_url, 
-                data=json_str, 
+                self.full_url,
+                data=json_str,
                 auth=(self.user, self.password),
                 headers={'Content-Type': 'application/json'},
                 timeout=30
@@ -129,26 +124,28 @@ class CacheManager:
         return {}
 
     @staticmethod
-    def update(index, cookie_str):
-        dav = WebDavManager()
+    def update(index, cookie_str, upload=True):
+        """只在内容真正变化时才写盘/上传，减少无效 WebDAV 请求。"""
         data = CacheManager.load()
         key = str(index)
-        
-        # 只要调用update就保存，确保最新
-        if data.get(key) != cookie_str:
-            data[key] = cookie_str
-            with open(LOCAL_CACHE_PATH, 'w', encoding='utf-8') as f:
-                json.dump(data, f, indent=2)
-            log_print(f"💾 [账号 {index + 1}] 本地缓存已更新")
-            dav.upload(data)
+
+        if data.get(key) == cookie_str:
+            return  # 无变化，跳过
+
+        data[key] = cookie_str
+        with open(LOCAL_CACHE_PATH, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2)
+        log_print(f"💾 [账号 {index + 1}] 本地缓存已更新")
+
+        if upload:
+            WebDavManager().upload(data)
 
 # ================= 核心机器人类 =================
 class HidenCloudBot:
     def __init__(self, env_cookie, index):
         self.index = index + 1
         self.base_url = "https://dash.hidencloud.com"
-        
-        # 使用 Cloudscraper
+
         self.session = cloudscraper.create_scraper(
             browser={
                 'browser': 'chrome',
@@ -156,14 +153,15 @@ class HidenCloudBot:
                 'desktop': True
             }
         )
-        
+
         self.csrf_token = ""
         self.services = []
-        
-        # 加载 Cookie
+        # 跨服务去重集合，避免对同一张账单反复尝试支付
+        self.processed_invoices = set()
+
         cached_data = CacheManager.load()
         cached_cookie = cached_data.get(str(index))
-        
+
         if cached_cookie:
             log_print(f"[账号 {self.index}] 发现本地缓存 Cookie，优先使用...")
             self.load_cookie_str(cached_cookie)
@@ -187,8 +185,9 @@ class HidenCloudBot:
     def get_cookie_str(self):
         return '; '.join([f"{c.name}={c.value}" for c in self.session.cookies])
 
-    def save_current_cookies(self):
-        CacheManager.update(self.index - 1, self.get_cookie_str())
+    def save_cookies(self, upload=True):
+        """由关键操作节点显式调用，而非每次请求都触发。"""
+        CacheManager.update(self.index - 1, self.get_cookie_str(), upload=upload)
 
     def reset_to_env(self, env_cookie):
         self.session.cookies.clear()
@@ -199,17 +198,27 @@ class HidenCloudBot:
         full_url = urljoin(self.base_url, url)
         try:
             resp = self.session.request(method, full_url, data=data, headers=headers, timeout=30)
-            self.save_current_cookies()
             return resp
         except Exception as e:
             self.log(f"请求异常: {e}")
             raise
 
+    def _refresh_csrf(self, soup):
+        """从页面 HTML 中刷新 CSRF token，防止因 token 过期导致 419 错误。"""
+        token_tag = soup.find('meta', attrs={'name': 'csrf-token'})
+        if token_tag:
+            self.csrf_token = token_tag['content']
+            return
+        # 降级：从表单 _token 字段读取
+        token_input = soup.find('input', attrs={'name': '_token'})
+        if token_input:
+            self.csrf_token = token_input['value']
+
     def init(self):
         self.log("正在验证登录状态...")
         try:
             res = self.request('GET', '/dashboard')
-            
+
             if '/login' in res.url:
                 self.log("❌ 当前 Cookie 已失效")
                 return False
@@ -217,9 +226,7 @@ class HidenCloudBot:
             soup = BeautifulSoup(res.text, 'html.parser')
             log_print(f"👀 [调试] 网页标题是: {soup.title.string if soup.title else '无标题'}")
 
-            token_tag = soup.find('meta', attrs={'name': 'csrf-token'})
-            if token_tag:
-                self.csrf_token = token_tag['content']
+            self._refresh_csrf(soup)
 
             self.services = []
             for a in soup.find_all('a', href=True):
@@ -230,6 +237,7 @@ class HidenCloudBot:
                         self.services.append({'id': svc_id, 'url': href})
 
             self.log(f"✅ 登录成功，发现 {len(self.services)} 个服务。")
+            self.save_cookies(upload=True)
             return True
         except Exception as e:
             self.log(f"❌ 初始化异常: {e}")
@@ -240,12 +248,13 @@ class HidenCloudBot:
         self.log(f">>> 处理服务 ID: {service['id']}")
 
         try:
-            # 1. 优先查缺补漏：先处理可能遗留的未支付历史账单
+            # 1. 预检：清理遗留未付账单（已处理过的会被 processed_invoices 过滤）
             self.check_and_pay_invoices(service['id'], is_precheck=True)
 
-            # 2. 获取管理页面获取最新状态
+            # 2. 获取管理页面，同时刷新 CSRF token
             manage_res = self.request('GET', f"/service/{service['id']}/manage")
             soup = BeautifulSoup(manage_res.text, 'html.parser')
+            self._refresh_csrf(soup)
 
             # ================== 3. 检测是否允许续期 ==================
             renew_btn = soup.find('button', onclick=re.compile(r'showRenewAlert'))
@@ -259,13 +268,9 @@ class HidenCloudBot:
 
                     if days_until > threshold:
                         threshold_text = "1 day" if threshold == 1 else f"{threshold} days"
-                        if is_free:
-                            msg = f"免费服务剩余时间低于 {threshold_text} 才可续期。当前剩余: {days_until} 天。"
-                        else:
-                            msg = f"剩余时间低于 {threshold_text} 才可续期。当前剩余: {days_until} 天。"
-                        
-                        self.log(f"⏳ 暂未到达续期时间: {msg}")
-                        return # 尚未到达限制，直接退出处理下一个
+                        kind = "免费服务" if is_free else "服务"
+                        self.log(f"⏳ 暂未到达续期时间: {kind}剩余时间低于 {threshold_text} 才可续期。当前剩余: {days_until} 天。")
+                        return
 
             # ================== 4. 执行单次精准续期 ==================
             token_input = soup.find('input', attrs={'name': '_token'})
@@ -282,7 +287,7 @@ class HidenCloudBot:
                 'X-CSRF-TOKEN': self.csrf_token,
                 'Referer': f"https://dash.hidencloud.com/service/{service['id']}/manage"
             }
-            
+
             res = self.request('POST', f"/service/{service['id']}/renew", data=payload, headers=headers)
 
             # ================== 5. 结果校验与支付 ==================
@@ -290,20 +295,15 @@ class HidenCloudBot:
                 self.log("⚡️ 续期成功，已跳转账单页，自动执行支付...")
                 self.perform_pay_from_html(res.text, res.url)
             else:
-                # ===== Fix 3: 先检查响应HTML里是否直接含有账单链接 =====
                 soup_resp = BeautifulSoup(res.text, 'html.parser')
                 for a in soup_resp.find_all('a', href=True):
                     if '/invoice/' in a['href']:
                         self.log(f"🔗 在响应HTML中发现账单链接: {a['href']}")
                         self.pay_single_invoice(a['href'])
                         return
-                # ===== Fix 3 结束 =====
-                # 核心改进：提取服务端拦截的真实报错信息
-                soup_err = BeautifulSoup(res.text, 'html.parser')
-                err_div = soup_err.find('div', class_=re.compile(r'(alert-danger|text-danger|error)'))
-                
+
+                err_div = soup_resp.find('div', class_=re.compile(r'(alert-danger|text-danger|error)'))
                 if err_div:
-                    # 抓取到了红字警告，说明被服务端逻辑拦截（如总时长超出上限等）
                     self.log(f"⚠️ 续期请求被服务端拒绝，页面提示: {err_div.get_text(strip=True)}")
                 else:
                     self.log(f"⚠️ 提交成功但未自动跳转，响应URL: {res.url} | 状态码: {res.status_code}")
@@ -312,41 +312,47 @@ class HidenCloudBot:
 
         except Exception as e:
             self.log(f"处理异常: {e}")
+        finally:
+            # 每处理完一个服务保存一次 Cookie，而非每次请求都上传
+            self.save_cookies(upload=True)
 
     def check_and_pay_invoices(self, service_id, is_precheck=False, retries=1):
-      if not is_precheck:
-          sleep_random(2000, 3000)
+        if not is_precheck:
+            sleep_random(2000, 3000)
 
-      for attempt in range(retries):
-          try:
-              res = self.request('GET', f"/service/{service_id}/invoices?where=unpaid")
-              soup = BeautifulSoup(res.text, 'html.parser')
+        for attempt in range(retries):
+            try:
+                res = self.request('GET', f"/service/{service_id}/invoices?where=unpaid")
+                soup = BeautifulSoup(res.text, 'html.parser')
 
-              invoice_links = []
-              for a in soup.find_all('a', href=True):
-                  if '/invoice/' in a['href'] and 'download' not in a['href']:
-                      invoice_links.append(a['href'])
+                invoice_links = []
+                for a in soup.find_all('a', href=True):
+                    href = a['href']
+                    if '/invoice/' in href and 'download' not in href:
+                        invoice_links.append(href)
 
-              unique_invoices = list(set(invoice_links))
+                # 过滤掉本次运行中已处理过的账单，避免重复操作
+                unique_invoices = [url for url in set(invoice_links)
+                                   if url not in self.processed_invoices]
 
-              if not unique_invoices:
-                  if retries > 1 and attempt < retries - 1:
-                      self.log(f"⚪ 第{attempt+1}次检查无账单，5秒后重试...")
-                      time.sleep(5)
-                      continue
-                  if not is_precheck:
-                      self.log("⚪ 无未支付账单")
-                  return
+                if not unique_invoices:
+                    if retries > 1 and attempt < retries - 1:
+                        self.log(f"⚪ 第{attempt+1}次检查无新账单，5秒后重试...")
+                        time.sleep(5)
+                        continue
+                    if not is_precheck:
+                        self.log("⚪ 无未支付账单")
+                    return
 
-              self.log(f"🔍 发现 {len(unique_invoices)} 个未付账单，准备清理...")
-              for url in unique_invoices:
-                  self.pay_single_invoice(url)
-                  sleep_random(3000, 5000)
-              return  # 成功处理后退出
+                self.log(f"🔍 发现 {len(unique_invoices)} 个未付账单，准备清理...")
+                for url in unique_invoices:
+                    self.pay_single_invoice(url)
+                    sleep_random(3000, 5000)
+                return
 
-          except Exception as e:
-              self.log(f"查账单出错: {e}")
-              return
+            except Exception as e:
+                self.log(f"查账单出错: {e}")
+                return
 
     def pay_single_invoice(self, url):
         try:
@@ -358,7 +364,8 @@ class HidenCloudBot:
 
     def perform_pay_from_html(self, html_content, current_url):
         soup = BeautifulSoup(html_content, 'html.parser')
-        
+        self._refresh_csrf(soup)
+
         target_form = None
         target_action = ""
 
@@ -370,9 +377,11 @@ class HidenCloudBot:
                     target_form = form
                     target_action = action
                     break
-        
+
         if not target_form:
             self.log("⚪ 页面未找到支付表单 (可能已支付)。")
+            # 已支付也记录，防止重复尝试
+            self.processed_invoices.add(current_url)
             return
 
         payload = {}
@@ -386,9 +395,10 @@ class HidenCloudBot:
         try:
             headers = {'X-CSRF-TOKEN': self.csrf_token, 'Referer': current_url}
             res = self.request('POST', target_action, data=payload, headers=headers)
-            
+
             if res.status_code == 200:
                 self.log("✅ 支付成功！")
+                self.processed_invoices.add(current_url)
             else:
                 self.log(f"⚠️ 支付响应: {res.status_code}")
         except Exception as e:
@@ -411,7 +421,7 @@ if __name__ == '__main__':
     for i, cookie in enumerate(cookies_list):
         bot = HidenCloudBot(cookie, i)
         success = bot.init()
-        
+
         if not success:
             bot.reset_to_env(cookie)
             success = bot.init()
@@ -421,13 +431,11 @@ if __name__ == '__main__':
                 bot.process_service(service)
         else:
             log_print(f"账号 {i + 1}: 登录失败，请检查 Cookie")
-        
+
         log_print("\n----------------------------------------\n")
         if i < len(cookies_list) - 1:
             sleep_random(5000, 10000)
 
-    # 推送所有日志
-    # 将日志数组合并成一个字符串
     final_content = "\n".join(ALL_LOGS)
     if final_content:
         send_notify("HidenCloud 续期报告", final_content)
