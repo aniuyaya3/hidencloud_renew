@@ -6,40 +6,63 @@ on:
     types:
       - completed
 
+# 必须增加权限，否则无法通过 gh 命令读取日志
+permissions:
+  contents: write
+  actions: read
+
 jobs:
   repo-sync:
     if: github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
-    timeout-minutes: 3
+    timeout-minutes: 5
 
     steps:
       - uses: actions/checkout@v4
         with:
           token: ${{ secrets.PAT }}
 
-      - name: Update Cron to Next 7 Days
+      - name: Parse Log and Update Cron
+        env:
+          GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
-          # 1. 计算 7 天后的具体日期 (日和月)
-          # %-d 和 %-m 会输出没有前导零的数字，非常适合 cron 格式
-          NEXT_DAY=$(date -d "+7 days" +"%-d")
-          NEXT_MONTH=$(date -d "+7 days" +"%-m")
+          # 1. 获取主工作流的日志
+          echo "正在获取主工作流日志..."
+          LOG_CONTENT=$(gh run view ${{ github.event.workflow_run.id }} --log)
+
+          # 2. 从日志中提取剩余天数 (匹配 "当前剩余: X 天")
+          # 提取数字，如果没有匹配到，默认设置为 7
+          DAYS_LEFT=$(echo "$LOG_CONTENT" | grep -oP '当前剩余: \s*\K[0-9]+' | head -1)
           
-          # 2. 生成随机分钟
+          if [ -z "$DAYS_LEFT" ]; then
+            echo "⚠️ 未能在日志中找到剩余天数，默认设置为 7 天后。"
+            TARGET_DAYS=7
+          else
+            echo "🔍 发现剩余天数: $DAYS_LEFT 天。"
+            TARGET_DAYS=$DAYS_LEFT
+          fi
+
+          # 3. 计算目标日期 (今天 + 剩余天数)
+          NEXT_DAY=$(date -d "+$TARGET_DAYS days" +"%-d")
+          NEXT_MONTH=$(date -d "+$TARGET_DAYS days" +"%-m")
+          
+          # 4. 生成随机分钟
           RANDOM_MIN=$(($RANDOM % 59))
           
-          # 3. 核心正则替换：保留原来的小时(比如2)，修改分钟、日、月
-          # 假设原内容是: - cron: '3 2 * * *' 或 '45 2 15 5 *'
-          # 替换后变成: - cron: '$RANDOM_MIN 2 $NEXT_DAY $NEXT_MONTH *'
+          # 5. 修改主工作流的 cron
+          # 保留原来的小时，修改分钟、日期、月份
           sed -i -E "s/(- cron: ')[0-9]+ ([0-9]+) [^']+(')/\1$RANDOM_MIN \2 $NEXT_DAY $NEXT_MONTH *\3/g" .github/workflows/main.yml
 
-          # 4. 提交更改
+          # 6. 提交并推送
           git config user.name github-actions
           git config user.email github-actions@github.com
           git add .github/workflows/main.yml
 
-          git diff --cached --quiet && exit 0
+          if git diff --cached --quiet; then
+            echo "没有变化，跳过提交。"
+            exit 0
+          fi
 
-          # 提交信息里记录一下下次运行的时间，方便在提交历史中查看
-          git commit -m "chore: set next run to $NEXT_MONTH-$NEXT_DAY at $RANDOM_MIN min"
+          git commit -m "chore: schedule next run in $TARGET_DAYS days ($NEXT_MONTH-$NEXT_DAY)"
           git push origin HEAD
