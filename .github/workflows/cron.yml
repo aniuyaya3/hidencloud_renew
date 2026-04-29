@@ -1,30 +1,45 @@
 name: Random Cron
+
 on:
-    workflow_run:
-      workflows: ["HidenCloud Auto Renew (Python)"]
-      types:
-        - completed
+  workflow_run:
+    workflows: ["HidenCloud Auto Renew (Python)"]
+    types:
+      - completed
+
 jobs:
-    repo-sync:
-      if: github.event.workflow_run.conclusion == 'success'
-      runs-on: ubuntu-latest
-      timeout-minutes: 3
+  repo-sync:
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
 
-      steps:
-        - uses: actions/checkout@v4
-          with:
-            token: ${{ secrets.PAT }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.PAT }}
 
-        - name: random cron
-          shell: bash
-          run: |
-            sed -i -E "s/(- cron: ')[0-9]+( [^[:space:]]+ \* \* \*')/\1$(($RANDOM % 59))\2/g" .github/workflows/main.yml
+      - name: Update Cron to Next 7 Days
+        shell: bash
+        run: |
+          # 1. 计算 7 天后的具体日期 (日和月)
+          # %-d 和 %-m 会输出没有前导零的数字，非常适合 cron 格式
+          NEXT_DAY=$(date -d "+7 days" +"%-d")
+          NEXT_MONTH=$(date -d "+7 days" +"%-m")
+          
+          # 2. 生成随机分钟
+          RANDOM_MIN=$(($RANDOM % 59))
+          
+          # 3. 核心正则替换：保留原来的小时(比如2)，修改分钟、日、月
+          # 假设原内容是: - cron: '3 2 * * *' 或 '45 2 15 5 *'
+          # 替换后变成: - cron: '$RANDOM_MIN 2 $NEXT_DAY $NEXT_MONTH *'
+          sed -i -E "s/(- cron: ')[0-9]+ ([0-9]+) [^']+(')/\1$RANDOM_MIN \2 $NEXT_DAY $NEXT_MONTH *\3/g" .github/workflows/main.yml
 
-            git config user.name github-actions
-            git config user.email github-actions@github.com
-            git add .github/workflows/main.yml
+          # 4. 提交更改
+          git config user.name github-actions
+          git config user.email github-actions@github.com
+          git add .github/workflows/main.yml
 
-            git diff --cached --quiet && exit 0
+          git diff --cached --quiet && exit 0
 
-            git commit -m "random cron"
-            git push origin HEAD
+          # 提交信息里记录一下下次运行的时间，方便在提交历史中查看
+          git commit -m "chore: set next run to $NEXT_MONTH-$NEXT_DAY at $RANDOM_MIN min"
+          git push origin HEAD
